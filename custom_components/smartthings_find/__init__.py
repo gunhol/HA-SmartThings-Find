@@ -11,7 +11,9 @@ from homeassistant.config_entries import ConfigEntry
 
 from .const import (
     DOMAIN,
-    CONF_JSESSIONID,
+    CONF_ACCESS_TOKEN,
+    CONF_REFRESH_TOKEN,
+    CONF_AUTH_SERVER_URL,
     CONF_ACTIVE_MODE_OTHERS,
     CONF_ACTIVE_MODE_OTHERS_DEFAULT,
     CONF_ACTIVE_MODE_SMARTTAGS,
@@ -19,7 +21,7 @@ from .const import (
     CONF_UPDATE_INTERVAL,
     CONF_UPDATE_INTERVAL_DEFAULT
 )
-from .utils import fetch_csrf, get_devices, get_device_location
+from .utils import get_devices, get_device_location
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -35,11 +37,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     
     hass.data[DOMAIN][entry.entry_id] = {}
 
-    # Load the jsessionid from the config and create a session from it
-    jsessionid = entry.data[CONF_JSESSIONID]
+    # Load the tokens from the config
+    access_token = entry.data.get(CONF_ACCESS_TOKEN)
+    refresh_token = entry.data.get(CONF_REFRESH_TOKEN)
+    auth_server_url = entry.data.get(CONF_AUTH_SERVER_URL)
+    
+    # Store in hass.data so utils can access it
+    hass.data[DOMAIN][entry.entry_id].update({
+        CONF_ACCESS_TOKEN: access_token,
+        CONF_REFRESH_TOKEN: refresh_token,
+        CONF_AUTH_SERVER_URL: auth_server_url
+    })
 
     session = async_get_clientsession(hass)
-    session.cookie_jar.update_cookies({"JSESSIONID": jsessionid})
+    # session.cookie_jar.update_cookies({"JSESSIONID": jsessionid}) # No longer needed
 
     active_smarttags = entry.options.get(CONF_ACTIVE_MODE_SMARTTAGS, CONF_ACTIVE_MODE_SMARTTAGS_DEFAULT)
     active_others = entry.options.get(CONF_ACTIVE_MODE_OTHERS, CONF_ACTIVE_MODE_OTHERS_DEFAULT)
@@ -49,9 +60,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         CONF_ACTIVE_MODE_OTHERS: active_others,
     })
 
-    # This raises ConfigEntryAuthFailed-exception if failed. So if we
-    # can continue after fetch_csrf, we know that authentication was ok
-    await fetch_csrf(hass, session, entry.entry_id)
+    # No CSRF fetch needed for OAuth
+    # await fetch_csrf(hass, session, entry.entry_id)
     
     # Load all SmartThings-Find devices from the users account
     devices = await get_devices(hass, session, entry.entry_id)

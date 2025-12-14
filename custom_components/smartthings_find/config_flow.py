@@ -9,7 +9,10 @@ from homeassistant.config_entries import (
 )
 from .const import (
     DOMAIN,
-    CONF_JSESSIONID,
+    CONF_ACCESS_TOKEN,
+    CONF_REFRESH_TOKEN,
+    CONF_USER_ID,
+    CONF_AUTH_SERVER_URL,
     CONF_UPDATE_INTERVAL,
     CONF_UPDATE_INTERVAL_DEFAULT,
     CONF_ACTIVE_MODE_SMARTTAGS,
@@ -17,7 +20,7 @@ from .const import (
     CONF_ACTIVE_MODE_OTHERS,
     CONF_ACTIVE_MODE_OTHERS_DEFAULT
 )
-from .utils import do_login_stage_one
+from .utils import do_login_stage_one, do_login_stage_two
 import asyncio
 import logging
 
@@ -43,108 +46,81 @@ class SmartThingsFindConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     error = None
 
-    async def do_stage_one(self):
-        _LOGGER.debug("Running login stage 1")
-        try:
-            stage_one_res = await do_login_stage_one(self.hass)
-            if not stage_one_res is None:
-                self.session, self.qr_url = stage_one_res
-            else:
-                self.error = "Login stage 1 failed. Check logs for details."
-                _LOGGER.warn("Login stage 1 failed")
-            _LOGGER.debug("Login stage 1 done")
-        except Exception as e:
-            self.error = "Login stage 1 failed. Check logs for details."
-            _LOGGER.error(f"Exception in stage 1: {e}", exc_info=True)
-
-    # async def do_stage_two(self):
-    #     _LOGGER.debug("Running login stage 2")
-    #     try: 
-    #         stage_two_res = await do_login_stage_two(self.session)
-    #         if not stage_two_res is None:
-    #             self.jsessionid = stage_two_res
-    #             _LOGGER.info("Login successful")
-    #         else:
-    #             self.error = "Login stage 2 failed. Check logs for details."
-    #             _LOGGER.warning("Login stage 2 failed")
-    #         _LOGGER.debug("Login stage 2 done")
-    #     except Exception as e:
-    #         self.error = "Login stage 2 failed. Check logs for details."
-    #         _LOGGER.error(f"Exception in stage 2: {e}", exc_info=True)
-
-
-    
-    # # Second step: Wait until QR scanned an log in
-    # async def async_step_auth_stage_two(self, user_input=None):
-    #     if not self.task_stage_two:
-    #         self.task_stage_two = self.hass.async_create_task(self.do_stage_two())
-    #     if not self.task_stage_two.done():
-    #         return self.async_show_progress(
-    #             progress_action="task_stage_two",
-    #             progress_task=self.task_stage_two,
-    #             description_placeholders={
-    #                 "qr_code": gen_qr_code_base64(self.qr_url),
-    #                 "url": self.qr_url,
-    #                 "code": self.qr_url.split('/')[-1],
-    #             }
-    #         )
-    #     return self.async_show_progress_done(next_step_id="finish")
-
     async def async_step_user(self, user_input=None):
-        """Redirect to finish step immediately."""
-        return await self.async_step_finish(user_input)
-
-    async def async_step_finish(self, user_input=None):
-        """Prompt for JSESSIONID and create entry."""
+        """Handle the initial step."""
         errors = {}
         if user_input is not None:
-            jsessionid = user_input.get(CONF_JSESSIONID)
-            if not jsessionid:
-                errors["base"] = "missing_jsessionid"
+             # This is actually not reached usually if we return showing form immediately
+             pass
+
+        # Call stage one to get the URL
+        login_url, err = await do_login_stage_one(self.hass)
+        if not login_url:
+            return self.async_show_form(
+                step_id="user",
+                errors={"base": "login_error"},
+                description_placeholders={"error_msg": err}
+            )
+        
+        # We store the state/verifier in hass.data in stage_one, so we are good.
+        
+        return self.async_step_auth_code(login_url=login_url)
+
+    async def async_step_auth_code(self, user_input=None, login_url=None):
+        """Step where user enters the redirect URL."""
+        errors = {}
+        if user_input is not None:
+            redirect_url_input = user_input.get("redirect_url")
+            
+            from .utils import do_login_stage_two
+            
+            token_data, user_id, auth_server_url = await do_login_stage_two(self.hass, redirect_url_input)
+            
+            if not token_data:
+                errors["base"] = "auth_failed"
+                # We might want to restart flow or let user try again
             else:
-                data = {CONF_JSESSIONID: jsessionid}
+                data = {
+                    CONF_ACCESS_TOKEN: token_data.get('access_token'),
+                    CONF_REFRESH_TOKEN: token_data.get('refresh_token'),
+                    CONF_USER_ID: user_id,
+                    CONF_AUTH_SERVER_URL: auth_server_url
+                }
+                
+                if self.reauth_entry:
+                     self.hass.config_entries.async_update_entry(self.reauth_entry, data=data)
+                     self.hass.async_create_task(self.hass.config_entries.async_reload(self.reauth_entry.entry_id))
+                     return self.async_abort(reason="reauth_successful")
+                
                 return self.async_create_entry(title="SmartThings Find", data=data)
 
-        data_schema = vol.Schema({
-            vol.Required(CONF_JSESSIONID): str
-        })
+        # If we came from step_user, login_url is set. If we repost form with error, it is lost unless we store it?
+        # But step_auth_code calls itself? 
+        # Actually `async_step_user` called this.
+        # Ideally we'd store login_url in self if we want to persist it across error re-renders.
+        if login_url:
+            self.login_url = login_url
+        
         return self.async_show_form(
-            step_id="finish",
-            data_schema=data_schema,
+            step_id="auth_code",
+            data_schema=vol.Schema({
+                vol.Required("redirect_url"): str
+            }),
+            description_placeholders={
+                "login_url": self.login_url
+            },
             errors=errors
         )
 
-    # async def async_step_finish(self, user_input=None):
-    #     if self.error:
-    #         return self.async_show_form(step_id="finish", errors={'base': self.error})
-    #     data={CONF_JSESSIONID: self.jsessionid}
-        
-    #     if self.reauth_entry:
-    #         # Finish step was called by reauth-flow. Do not create a new entry,
-    #         # instead update the existing entry
-    #         return self.async_update_reload_and_abort(
-    #             self.reauth_entry,
-    #             data=data
-    #         )
-        
-        # return self.async_create_entry(title="SmartThings Find", data=data)
-
-    async def async_step_reauth(self, user_input=None):
+    async def async_step_reauth(self, entry_data: dict[str, Any] | None = None):
         self.reauth_entry = self.hass.config_entries.async_get_entry(
             self.context["entry_id"]
         )
-        return await self.async_step_reauth_confirm()
-
-    async def async_step_reauth_confirm(self, user_input=None):
-        if user_input is None:
-            return self.async_show_form(
-                step_id="user",
-                data_schema=vol.Schema({}),
-            )
         return await self.async_step_user()
+
     
     async def async_step_reconfigure(self, user_input: dict[str, Any] | None = None):
-        return await self.async_step_reauth_confirm(self)
+        return await self.async_step_user()
     
     @staticmethod
     @callback

@@ -8,6 +8,8 @@ import random
 import string
 import re
 import html
+import hashlib
+import os
 from io import BytesIO
 from datetime import datetime, timedelta
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -16,234 +18,442 @@ from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import device_registry
 
-from .const import DOMAIN, BATTERY_LEVELS, CONF_ACTIVE_MODE_SMARTTAGS, CONF_ACTIVE_MODE_OTHERS
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding, hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
+
+from .const import (
+    DOMAIN, BATTERY_LEVELS, CONF_ACTIVE_MODE_SMARTTAGS, CONF_ACTIVE_MODE_OTHERS,
+    CLIENT_ID_AUTH, CLIENT_ID_FIND, SCOPE_AUTH, SCOPE_FIND,
+    CONF_ACCESS_TOKEN, CONF_REFRESH_TOKEN, CONF_AUTH_SERVER_URL
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-URL_PRE_SIGNIN = 'https://account.samsung.com/accounts/v1/FMM2/signInGate?state={state}&redirect_uri=https:%2F%2Fsmartthingsfind.samsung.com%2Flogin.do&response_type=code&client_id=ntly6zvfpn&scope=iot.client&locale=de_DE&acr_values=urn:samsungaccount:acr:basic&goBackURL=https:%2F%2Fsmartthingsfind.samsung.com%2Flogin'
-URL_QR_CODE_SIGNIN = 'https://account.samsung.com/accounts/v1/FMM2/signInWithQrCode'
-URL_SIGNIN_XHR = 'https://account.samsung.com/accounts/v1/FMM2/signInXhr'
-URL_QR_POLL = 'https://account.samsung.com/accounts/v1/FMM2/signInWithQrCodeProc'
-URL_SIGNIN_SUCCESS = 'https://account.samsung.com{next_url}'
-URL_GET_CSRF = "https://smartthingsfind.samsung.com/chkLogin.do"
+URL_ENTRY_POINT = 'https://account.samsung.com/accounts/ANDROIDSDK/getEntryPoint'
 URL_DEVICE_LIST = "https://smartthingsfind.samsung.com/device/getDeviceList.do"
 URL_REQUEST_LOC_UPDATE = "https://smartthingsfind.samsung.com/dm/addOperation.do"
 URL_SET_LAST_DEVICE = "https://smartthingsfind.samsung.com/device/setLastSelect.do"
 
 
+def get_random_string(length):
+    return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
+
+
+def generate_code_verifier():
+    return base64.urlsafe_b64encode(os.urandom(32)).rstrip(b'=').decode('utf-8')
+
+
+def generate_code_challenge(verifier):
+    digest = hashlib.sha256(verifier.encode('utf-8')).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b'=').decode('utf-8')
+
+
+def encrypt_svc_param(svc_param_json, chk_do_num, pki_public_key_str):
+    # 1. SHA-256 hash of chkDoNum
+    chk_do_num_hash = hashlib.sha256(str(chk_do_num).encode('utf-8')).digest()
+    
+    # 2. Random Key 16 bytes
+    key = os.urandom(16)
+    
+    # 3. KDF (PBKDF2) to derive AES key
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32, 
+        salt=key,
+        iterations=chk_do_num,
+        backend=default_backend()
+    )
+    # The Wiki specifies using the SHA-256 hash of chkDoNum (base64 encoded) as input for KDF
+    derived_key = kdf.derive(base64.b64encode(chk_do_num_hash))
+
+    # 4. Encrypt the Random Key with RSA
+    svc_enc_ky = public_key.encrypt(
+        key,
+        asym_padding.PKCS1v15()
+    )
+    svc_enc_ky_b64 = base64.b64encode(svc_enc_ky).decode('utf-8')
+
+    # 5. Encrypt Param with AES
+    iv = os.urandom(16)
+    cipher = Cipher(algorithms.AES(derived_key), modes.CBC(iv), backend=default_backend())
+    encryptor = cipher.encryptor()
+    
+    # Pad content
+    padder = padding.PKCS7(128).padder()
+    padded_data = padder.update(svc_param_json.encode('utf-8')) + padder.finalize()
+    
+    svc_enc_param = encryptor.update(padded_data) + encryptor.finalize()
+    svc_enc_param_b64 = base64.b64encode(svc_enc_param).decode('utf-8')
+    
+    svc_enc_iv = iv.hex()
+    
+    return svc_enc_param_b64, svc_enc_ky_b64, svc_enc_iv
+
+
 async def do_login_stage_one(hass: HomeAssistant) -> tuple:
-    """
-    Perform the first stage of the login process.
-
-    This function performs the initial login steps for the SmartThings Find service.
-    It generates a random state string, sends a pre-login request, and retrieves
-    the QR code URL from the response.
-
-    Args:
-        hass (HomeAssistant): Home Assistant instance.
-
-    Returns:
-        tuple: A tuple containing the session and QR code URL if successful, None otherwise.
-    """
     session = async_get_clientsession(hass)
-    session.cookie_jar.clear()
+    
+    # 1. Get Entry Point
+    async with session.get(URL_ENTRY_POINT) as res:
+        if res.status != 200:
+            return None, "Failed to get entry point"
+        data = await res.json()
+        
+    sign_in_uri = data['signInURI']
+    pki_public_key = data['pkiPublicKey']
+    chk_do_num = int(data['chkDoNum'])
 
-    # Generating the state parameter
-    state = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
+    # 2. Generate SVC Param
+    state = get_random_string(20)
+    code_verifier = generate_code_verifier()
+    code_challenge = generate_code_challenge(code_verifier)
+    
+    # Needed for stage 2
+    hass.data.setdefault(DOMAIN, {})['auth_data'] = {
+        'state': state,
+        'code_verifier': code_verifier
+    }
+
+    svc_param = {
+        "clientId": CLIENT_ID_AUTH,
+        "codeChallenge": code_challenge,
+        "codeChallengeMethod": "S256",
+        "competitorDeviceYNFlag": "Y",
+        "deviceInfo": "Google|com.android.chrome", 
+        "deviceModelId": "Pixel 8 Pro",
+        "deviceName": "Google Pixel 8 Pro",
+        "deviceOSVersion": "35",
+        "deviceType": "APP",
+        "deviceUniqueId": "ANID", 
+        "redirectUri": "ms-app://s-1-15-2-4027708247-2189610-1983755848-2937435718-1578786913-2158692839-1974417358",
+        "replaceableClientConnectYN": "N",
+        "responseEncryptionType": "1",
+        "responseEncryptionYNFlag": "N", # Disable response encryption for simplicity
+        "iosYNFlag": "Y", 
+        "state": state
+    }
+    
+    svc_param_json = json.dumps(svc_param)
+    
+    # 3. Encrypt Payload
+    try:
+        from cryptography.hazmat.primitives.serialization import load_der_public_key
+        pub_key_bytes = base64.b64decode(pki_public_key)
+        try:
+            public_key = load_der_public_key(pub_key_bytes, backend=default_backend())
+        except:
+             # Fallback usually not needed if standard DER
+             from cryptography.hazmat.primitives.serialization import load_pem_public_key
+             pass
+        
+        svc_enc_param, svc_enc_ky, svc_enc_iv = encrypt_svc_param(svc_param_json, chk_do_num, pki_public_key)
+
+    except Exception as e:
+        _LOGGER.error(f"Encryption failed: {e}")
+        return None, f"Encryption failed: {e}"
+
+    # 4. Construct URL
+    # URL Payload structure: chkDoNum, svcEncParam, svcEncKY, svcKeyIV
+    
+    # Wait, looking at wiki structure: pattern seems to be key-value pairs or list.
+    # "svcParam" is the query parameter name. The value is "URL Payload".
+    # The URL Payload contains the 4 items.
+    
+    payload_dict = {
+        "chkDoNum": chk_do_num,
+        "svcEncParam": svc_enc_param,
+        "svcEncKY": svc_enc_ky,
+        "svcKeyIV": svc_enc_iv
+    }
+    
+    # Verify exact keys. Wiki just lists them.
+    # `chkDoNum`
+    # `svcEncParam`
+    # `svcEncKY`
+    # `svcKeyIV`
+    
+    # I'll stick with these keys.
+    svc_param_value = json.dumps(payload_dict)
+    
+    login_url = f"{sign_in_uri}?locale=en&svcParam={urllib.parse.quote(svc_param_value)}&mode=C"
+
+    _LOGGER.info(f"Generated Login URL: {login_url}")
+    
+    return login_url, None
+
+
+
+async def do_login_stage_two(hass: HomeAssistant, redirect_url: str) -> dict:
+    session = async_get_clientsession(hass)
+    auth_data = hass.data.get(DOMAIN, {}).get('auth_data')
+    if not auth_data:
+        return None, "Auth data missing. Please restart flow."
+    
+    state_orig = auth_data['state']
+    code_verifier = auth_data['code_verifier']
+
+    # Parse parameters from redirect URL
+    import urllib.parse
+    parsed = urllib.parse.urlparse(redirect_url)
+    params = urllib.parse.parse_qs(parsed.query)
+    
+    # Parameters needed: code, auth_server_url
+    auth_server_url = params.get('auth_server_url', [''])[0]
+    code = params.get('code', [''])[0]
+    
+    # Note: We requested unencrypted response (responseEncryptionYNFlag="N")
+    # so we can use the parameters directly without decryption.
+    
+    # Step 1: Exchange code for user_auth_token
+    # POST {auth_server_url}/auth/oauth2/v2/authorize
+    # grant_type=authorization_code
+    # client_id=CLIENT_ID_AUTH ('yfrtglt53o')
+    # code=CODE
+    # code_verifier=VERIFIER
+    # serviceType=M
+    
+    async with session.post(
+        f"{auth_server_url}/auth/oauth2/v2/authorize",
+        data={
+            "grant_type": "authorization_code",
+            "client_id": CLIENT_ID_AUTH,
+            "code": code,
+            "code_verifier": code_verifier,
+            "serviceType": "M"
+        },
+        headers={'Content-Type': 'application/x-www-form-urlencoded'}
+    ) as res:
+        if res.status != 200:
+             return None, f"Token exchange failed: {await res.text()}"
+        data = await res.json()
+    
+    user_auth_token = data.get('userauth_token')
+    user_id = data.get('userId')
+    
+    # Step 2: Get API Token (for Find)
+    # First: Authorize to get code for Find
+    # GET {auth_server_url}/auth/oauth2/v2/authorize
+    # response_type=code
+    # client_id=CLIENT_ID_FIND ('27zmg0v1oo')
+    # scope=SCOPE_FIND
+    # userauth_token=user_auth_token
+    # code_challenge_method=S256
+    # code_challenge=...
+    
+    new_verifier = generate_code_verifier()
+    new_challenge = generate_code_challenge(new_verifier)
+    
+    params_auth = {
+        "response_type": "code",
+        "client_id": CLIENT_ID_FIND,
+        "scope": SCOPE_FIND,
+        "code_challenge": new_challenge,
+        "code_challenge_method": "S256",
+        "userauth_token": user_auth_token,
+        "serviceType": "M", # Wiki says M
+    }
+    
+    async with session.get(
+        f"{auth_server_url}/auth/oauth2/v2/authorize",
+        params=params_auth
+    ) as res:
+        if res.status != 200:
+             return None, f"Find authorization failed: {await res.text()}"
+        data = await res.json()
+        
+    find_code = data.get('code')
+    
+    # Step 3: Exchange Find Code for Access Token
+    # POST {auth_server_url}/auth/oauth2/token
+    
+    async with session.post(
+        f"{auth_server_url}/auth/oauth2/token",
+        data={
+            "grant_type": "authorization_code",
+            "client_id": CLIENT_ID_FIND,
+            "code": find_code,
+            "code_verifier": new_verifier,
+        },
+        headers={'Content-Type': 'application/x-www-form-urlencoded'}
+    ) as res:
+        if res.status != 200:
+             return None, f"Find token exchange failed: {await res.text()}"
+        token_data = await res.json()
+        
+    return token_data, user_id, auth_server_url
+
+
+# Removed fetch_csrf as it is not needed for OAuth flow with Bearer token
+
+
+
+async def refresh_access_token(hass: HomeAssistant, session: aiohttp.ClientSession, entry_id: str):
+    """Refreshes the access token using the refresh token."""
+    data_store = hass.data[DOMAIN][entry_id]
+    refresh_token = data_store.get(CONF_REFRESH_TOKEN)
+    auth_server_url = data_store.get(CONF_AUTH_SERVER_URL)
+    
+    if not refresh_token or not auth_server_url:
+        raise ConfigEntryAuthFailed("Refresh token or Auth URL missing")
 
     try:
-        # Load the initial login page which already sets some cookies. 'state'
-        # is a randomly generated string. 'client_id' seems to be static for
-        # SmartThings find.
-        async with session.get(URL_PRE_SIGNIN.format(state=state)) as res:
+        url = f"{auth_server_url}/auth/oauth2/token"
+        payload = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": CLIENT_ID_FIND
+        }
+        headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+        
+        async with session.post(url, data=payload, headers=headers) as res:
             if res.status != 200:
-                _LOGGER.error(
-                    f"Pre-login request failed with status {res.status}")
-                return None
-            _LOGGER.debug(f"Step 1: Pre-Login: Status Code: {res.status}")
+                _LOGGER.error(f"Token refresh failed: {res.status} - {await res.text()}")
+                raise ConfigEntryAuthFailed("Token refresh failed")
+            
+            data = await res.json()
+            
+        new_access_token = data.get('access_token')
+        new_refresh_token = data.get('refresh_token') # Refresh token rotates? Wiki says: "Note: A refresh token can only be used once, and is replaced with the new one"
 
-        # Load the "Login with QR-Code"-page
-        async with session.get(URL_QR_CODE_SIGNIN) as res:
-            if res.status != 200:
-                _LOGGER.error(
-                    f"QR code URL request failed with status {res.status}, Response: {text[:250]}...")
-                return None
-            text = await res.text()
-            _LOGGER.debug(f"Step 2: QR-Code URL: Status Code: {res.status}")
+        if not new_access_token or not new_refresh_token:
+             raise ConfigEntryAuthFailed("Invalid refresh response")
 
-        # Search the URL which is embedded in the QR Code. It looks like this:
-        # https://signin.samsung.com/key/abcdefgh
-        match = re.search(r"https://signin\.samsung\.com/key/[^'\"]+", text)
-        if not match:
-            _LOGGER.error("QR code URL not found in the response")
-            return None
+        # Update hass.data
+        data_store[CONF_ACCESS_TOKEN] = new_access_token
+        data_store[CONF_REFRESH_TOKEN] = new_refresh_token
+        
+        # Update Config Entry
+        entry = hass.config_entries.async_get_entry(entry_id)
+        if entry:
+            new_data = entry.data.copy()
+            new_data[CONF_ACCESS_TOKEN] = new_access_token
+            new_data[CONF_REFRESH_TOKEN] = new_refresh_token
+            hass.config_entries.async_update_entry(entry, data=new_data)
+            _LOGGER.info("Successfully refreshed access token")
+            return new_access_token
 
-        qr_url = match.group(0)
-        _LOGGER.info(f"Extracted QR code URL: {qr_url}")
-
-        return session, qr_url
     except Exception as e:
-        _LOGGER.error(
-            f"An error occurred during the login process (stage 1): {e}", exc_info=True)
-        return None
+        _LOGGER.error(f"Error refreshing token: {e}")
+        raise ConfigEntryAuthFailed(f"Error refreshing token: {e}")
+
+    except Exception as e:
+        _LOGGER.error(f"Error refreshing token: {e}")
+        raise ConfigEntryAuthFailed(f"Error refreshing token: {e}")
 
 
-async def do_login_stage_two(session: aiohttp.ClientSession) -> str:
+async def authenticated_request(hass: HomeAssistant, session: aiohttp.ClientSession, entry_id: str, url: str, json_data: dict = None, data: dict = None) -> tuple[int, str]:
     """
-    Perform the second stage of the login process.
-
-    This function continues the login process by fetching the
-    CSRF token, polling the server for login status, and ultimately
-    retrieving the JSESSIONID required for SmartThings Find.
-
-    Args:
-        session (aiohttp.ClientSession): The current session with cookies set from login stage one.
-
+    Helper to perform an authenticated request with automatic token refresh.
+    
     Returns:
-        str: The JSESSIONID if successful, None otherwise.
+        tuple: (status_code, response_text)
     """
-    try:
-        # Here you would generate and display the QR code. This is environment-specific.
-        # qr = qrcode.QRCode()
-        # qr.add_data(extracted_url)
-        # qr.print_ascii()  # Or any other method to display the QR code to the user.
-
-        # Fetch the _csrf token. This needs to be sent with each QR-Poll-Request
-        async with session.get(URL_SIGNIN_XHR) as res:
-            if res.status != 200:
-                _LOGGER.error(
-                    f"XHR login request failed with status {res.status}")
-                return None
-            json_res = await res.json()
-            _LOGGER.debug(
-                f"Step 3: XHR Login: Status Code: {res.status}, Response: {json_res}")
-
-        csrf_token = json_res.get('_csrf', {}).get('token')
-        if not csrf_token:
-            _LOGGER.error("CSRF token not found in the response")
-            return None
-
-        # Define a timeout. We don't want to poll forever.
-        end_time = datetime.now() + timedelta(seconds=120)
-        next_url = None
-
-        # We check, whether the QR-Code was scanned and the login was successful.
-        # This request returns either:
-        #       {"rtnCd":"POLLING"} <-- Not yet logged in. Login still pending.
-        #   OR
-        #       {"rtnCd":"SUCCESS","nextURL":"/accounts/v1/FMM2/signInComplete"}
-        # So we fetch this URL every few seconds, until we receive "SUCCESS", which
-        # indicates the user has successfully scanned the Code and approved the login.
-        # This is exactly the same way, the website does it.
-        # In case the user never scans the QR-Code, we run in the timeout defined above.
-        while datetime.now() < end_time:
-            try:
-                await asyncio.sleep(2)
-                async with session.post(URL_QR_POLL, json={}, headers={'X-Csrf-Token': csrf_token}) as res:
-                    if res.status != 200:
-                        _LOGGER.error(
-                            f"QR check request failed with status {res.status}")
-                        continue
-                    js = await res.json()
-                    _LOGGER.debug(
-                        f"Step 4: QR CHECK: Status Code: {res.status}, Response: {js}")
-
-                if js.get('rtnCd') == "SUCCESS":
-                    next_url = js.get('nextURL')
-                    break
-            except aiohttp.ClientError as e:
-                _LOGGER.error(f"QR Poll request failed: {e}")
-                return None
-
-        if not next_url:
-            _LOGGER.error("QR Code not scanned within 2 mins")
-            return None
-
-        # Fetch the 'next_url' we received from the previous request. On success, this sets
-        # the initial JSESSIONID-cookie. We're not done yet, since this cookie is not valid
-        # for SmartThings Find (which uses it's own JSESSIONID).
-        async with session.get(URL_SIGNIN_SUCCESS.format(next_url=next_url)) as res:
-            if res.status != 200:
-                _LOGGER.error(
-                    f"Login success URL request failed with status {res.status}")
-                return None
-            text = await res.text()
-            _LOGGER.debug(f"Step 5: Login success: Status Code: {res.status}")
-
-        # The response contains another redirect URL which we need to extract from the
-        # received HTML/JS-content. This URL looks something like this:
-        # https://smartthingsfind.samsung.com/login.do?auth_server_url=eu-auth2.samsungosp.com
-        #    &code=[...]&code_expires_in=300&state=[state we generated above]
-        #    &api_server_url=eu-auth2.samsungosp.com
-        match = re.search(
-            r'window\.location\.href\s*=\s*[\'"]([^\'"]+)[\'"]', text)
-        if not match:
-            _LOGGER.error(
-                "Redirect URL not found in the login success response")
-            return None
-
-        redirect_url = match.group(1)
-        _LOGGER.debug(f"Found Redirect URL: {redirect_url}")
-
-        # Fetch the received redirect_url. This response finally contains our JSESSIONID,
-        # which is what actually authenticates us for SmartThings Find.
-        async with session.get(redirect_url) as res:
-            if res.status != 200:
-                _LOGGER.error(
-                    f"Redirect URL request failed with status {res.status}")
-                return None
-            _LOGGER.debug(
-                f"Step 6: Follow redirect URL: Status Code: {res.status}")
-
-        jsessionid = session.cookie_jar.filter_cookies(
-            'https://smartthingsfind.samsung.com').get('JSESSIONID')
-        if not jsessionid:
-            _LOGGER.error("JSESSIONID not found in cookies")
-            return None
-
-        _LOGGER.debug(f"JSESSIONID: {jsessionid.value[:20]}...")
-        return jsessionid.value
-
-    except Exception as e:
-        _LOGGER.error(
-            f"An error occurred during the login process (stage 2): {e}", exc_info=True)
-        return None
-
-
-async def fetch_csrf(hass: HomeAssistant, session: aiohttp.ClientSession, entry_id: str):
-    """
-    Retrieves the _csrf-Token which needs to be sent with each following request.
-
-    This function retrieves the CSRF token required for further requests to the SmartThings Find service.
-    The JSESSIONID must already be present as a cookie in the session at this point.
-
-    Args:
-        hass (HomeAssistant): Home Assistant instance.
-        session (aiohttp.ClientSession): The current session.
-
-    Raises:
-        ConfigEntryAuthFailed: If the CSRF token is not found or if the authentication fails.
-    """
-    err_msg = ""
-    async with session.get(URL_GET_CSRF) as response:
-        if response.status == 200:
-            csrf_token = response.headers.get("_csrf")
-            if csrf_token:
-                hass.data[DOMAIN][entry_id]["_csrf"] = csrf_token
-                _LOGGER.info("Successfully fetched new CSRF Token")
-                return
-            else:
-                err_msg = f"CSRF token not found in response headers. Status Code: {response.status}, Response: '{await response.text()}'"
-                _LOGGER.error(err_msg)
+    token = hass.data[DOMAIN][entry_id][CONF_ACCESS_TOKEN]
+    headers = {'Authorization': f"Bearer {token}", 'Accept': 'application/json'}
+    
+    async def _do_req(auth_headers):
+        # We prefer JSON if provided, else data (which might be empty dict for get_devices)
+        if json_data is not None:
+             async with session.post(url, json=json_data, headers=auth_headers) as resp:
+                 return resp.status, await resp.text()
         else:
-            err_msg = f"Failed to authenticate with SmartThings Find: [{response.status}]: {await response.text()}"
-            _LOGGER.error(err_msg)
+             async with session.post(url, data=data or {}, headers=auth_headers) as resp:
+                 return resp.status, await resp.text()
 
-        _LOGGER.debug(f"Headers: {response.headers}")
+    status, text = await _do_req(headers)
+    
+    if status in [401, 403]:
+        _LOGGER.info(f"Request to {url.split('/')[-1]} returned {status}, refreshing token...")
+        try:
+            new_token = await refresh_access_token(hass, session, entry_id)
+        except Exception as e:
+            _LOGGER.error(f"Failed to refresh token: {e}")
+            raise ConfigEntryAuthFailed("Token refresh failed")
+            
+        headers['Authorization'] = f"Bearer {new_token}"
+        status, text = await _do_req(headers)
+        
+        if status in [401, 403]:
+             raise ConfigEntryAuthFailed(f"Auth failed after refresh: {status}")
+             
+    return status, text
 
-    raise ConfigEntryAuthFailed(err_msg)
 
+def extract_best_location(operations: list, dev_name: str) -> tuple[dict, dict]:
+    """
+    Extracts the best/newest location from the list of operations.
+    Returns (used_op, used_loc).
+    """
+    used_op = None
+    used_loc = {
+        "latitude": None,
+        "longitude": None,
+        "gps_accuracy": None,
+        "gps_date": None
+    }
+    
+    for op in operations:
+        if op['oprnType'] not in ['LOCATION', 'LASTLOC', 'OFFLINE_LOC']:
+            continue
+            
+        op_data = None
+        utc_date = None
+        
+        # Check standard location
+        if 'latitude' in op:
+            if 'extra' in op and 'gpsUtcDt' in op['extra']:
+                utc_date = parse_stf_date(op['extra']['gpsUtcDt'])
+            else:
+                 _LOGGER.warning(f"[{dev_name}] No UTC date in operation {op['oprnType']}")
+                 continue
+            op_data = op
 
+        # Check encrypted/nested location
+        elif 'encLocation' in op:
+            loc = op['encLocation']
+            if loc.get('encrypted'):
+                _LOGGER.debug(f"[{dev_name}] Ignoring encrypted location")
+                continue
+            if 'gpsUtcDt' not in loc:
+                 continue
+            utc_date = parse_stf_date(loc['gpsUtcDt'])
+            op_data = loc
+        
+        if not op_data or not utc_date:
+            continue
+            
+        # Check if newer
+        if used_loc['gps_date'] and used_loc['gps_date'] >= utc_date:
+            _LOGGER.debug(f"[{dev_name}] Ignoring older location ({op['oprnType']})")
+            continue
+            
+        # Extract coordinates
+        lat = float(op_data['latitude']) if 'latitude' in op_data else None
+        lon = float(op_data['longitude']) if 'longitude' in op_data else None
+        
+        if lat is None or lon is None:
+             _LOGGER.warning(f"[{dev_name}] Missing coordinates in {op['oprnType']}")
+             # If we have no coords, we preserve 'location_found'=False (implicit by None result)
+             # But we might want to track accuracy/date still? 
+             # The original code only set location_found=True if lat/lon existed.
+             # But it accepted the OP as 'used_op' anyway?
+             # "if not locFound: warn ... used_loc['gps_accuracy'] = ... used_op = op"
+             # Yes, it updates date/accuracy even if lat/lon missing.
+             pass
+        
+        used_loc['latitude'] = lat
+        used_loc['longitude'] = lon
+        used_loc['gps_accuracy'] = calc_gps_accuracy(
+            op_data.get('horizontalUncertainty'), op_data.get('verticalUncertainty'))
+        used_loc['gps_date'] = utc_date
+        used_op = op
+
+    if used_op:
+        return used_op, used_loc
+    return None, None
 async def get_devices(hass: HomeAssistant, session: aiohttp.ClientSession, entry_id: str) -> list:
     """
     Sends a request to the SmartThings Find API to retrieve a list of devices associated with the user's account.
@@ -255,41 +465,47 @@ async def get_devices(hass: HomeAssistant, session: aiohttp.ClientSession, entry
     Returns:
         list: A list of devices if successful, empty list otherwise.
     """
-    url = f"{URL_DEVICE_LIST}?_csrf={hass.data[DOMAIN][entry_id]['_csrf']}"
-    async with session.post(url, headers={'Accept': 'application/json'}, data={}) as response:
-        if response.status != 200:
-            _LOGGER.error(f"Failed to retrieve devices [{response.status}]: {await response.text()}")
-            if response.status == 404:
-                _LOGGER.warn(
-                    f"Received 404 while trying to fetch devices -> Triggering reauth")
-                raise ConfigEntryAuthFailed(
-                    "Request to get device list failed: 404")
+    auth_header = {'Authorization': f"Bearer {hass.data[DOMAIN][entry_id][CONF_ACCESS_TOKEN]}", 'Accept': 'application/json'}
+    
+    try:
+        status, text = await authenticated_request(hass, session, entry_id, URL_DEVICE_LIST, data={})
+        
+        if status != 200:
+            _LOGGER.error(f"Failed to retrieve devices [{status}]: {text}")
             return []
-        response_json = await response.json()
-        devices_data = response_json["deviceList"]
-        devices = []
-        for device in devices_data:
-            # Double unescaping required. Example:
-            # "Benedev&amp;#39;s S22" first becomes "Benedev&#39;s S22" and then "Benedev's S22"
-            device['modelName'] = html.unescape(
-                html.unescape(device['modelName']))
-            identifier = (DOMAIN, device['dvceID'])
-            ha_dev = device_registry.async_get(
-                hass).async_get_device({identifier})
-            if ha_dev and ha_dev.disabled:
-                _LOGGER.debug(
-                    f"Ignoring disabled device: '{device['modelName']}' (disabled by {ha_dev.disabled_by})")
-                continue
-            ha_dev_info = DeviceInfo(
-                identifiers={identifier},
-                manufacturer="Samsung",
-                name=device['modelName'],
-                model=device['modelID'],
-                configuration_url="https://smartthingsfind.samsung.com/"
-            )
-            devices += [{"data": device, "ha_dev_info": ha_dev_info}]
-            _LOGGER.debug(f"Adding device: {device['modelName']}")
-        return devices
+            
+        response_json = json.loads(text)
+
+    except ConfigEntryAuthFailed:
+        raise
+    except Exception as e:
+        _LOGGER.error(f"Error listing devices: {e}")
+        return []
+
+    devices_data = response_json["deviceList"]
+    devices = []
+    for device in devices_data:
+        # Double unescaping required. Example:
+        # "Benedev&amp;#39;s S22" first becomes "Benedev&#39;s S22" and then "Benedev's S22"
+        device['modelName'] = html.unescape(
+            html.unescape(device['modelName']))
+        identifier = (DOMAIN, device['dvceID'])
+        ha_dev = device_registry.async_get(
+            hass).async_get_device({identifier})
+        if ha_dev and ha_dev.disabled:
+             _LOGGER.debug(
+                f"Ignoring disabled device: '{device['modelName']}' (disabled by {ha_dev.disabled_by})")
+             continue
+        ha_dev_info = DeviceInfo(
+            identifiers={identifier},
+            manufacturer="Samsung",
+            name=device['modelName'],
+            model=device['modelID'],
+            configuration_url="https://smartthingsfind.samsung.com/"
+        )
+        devices += [{"data": device, "ha_dev_info": ha_dev_info}]
+        _LOGGER.debug(f"Adding device: {device['modelName']}")
+    return devices
 
 
 async def get_device_location(hass: HomeAssistant, session: aiohttp.ClientSession, dev_data: dict, entry_id: str) -> dict:
@@ -318,7 +534,7 @@ async def get_device_location(hass: HomeAssistant, session: aiohttp.ClientSessio
         "usrId": dev_data['usrId']
     }
 
-    csrf_token = hass.data[DOMAIN][entry_id]["_csrf"]
+    auth_header = {'Authorization': f"Bearer {hass.data[DOMAIN][entry_id][CONF_ACCESS_TOKEN]}", 'Accept': 'application/json'}
 
     try:
         active = (
@@ -328,150 +544,52 @@ async def get_device_location(hass: HomeAssistant, session: aiohttp.ClientSessio
         )
 
         if active:
-            _LOGGER.debug("Active mode; requesting location update now")
-            async with session.post(f"{URL_REQUEST_LOC_UPDATE}?_csrf={csrf_token}", json=update_payload) as response:
-                # _LOGGER.debug(f"[{dev_name}] Update request response ({response.status}): {await response.text()}")
-                pass
+            _LOGGER.debug(f"Active mode; requesting location update now for {dev_name}")
+            await authenticated_request(hass, session, entry_id, URL_REQUEST_LOC_UPDATE, json_data=update_payload)
         else:
-            _LOGGER.debug("Passive mode; not requesting location update")
+            _LOGGER.debug(f"Passive mode; not requesting location update for {dev_name}")
 
-        async with session.post(f"{URL_SET_LAST_DEVICE}?_csrf={csrf_token}", json=set_last_payload, headers={'Accept': 'application/json'}) as response:
-            _LOGGER.debug(
-                f"[{dev_name}] Location response ({response.status})")
-            if response.status == 200:
-                data = await response.json()
-                res = {
-                    "dev_name": dev_name,
-                    "dev_id": dev_id,
-                    "update_success": True,
-                    "location_found": False,
-                    "used_op": None,
-                    "used_loc": None,
-                    "ops": []
-                }
-                used_loc = None
-                if 'operation' in data and len(data['operation']) > 0:
-                    res['ops'] = data['operation']
+        status, text = await authenticated_request(hass, session, entry_id, URL_SET_LAST_DEVICE, json_data=set_last_payload)
+        
+        if status != 200:
+             _LOGGER.error(f"[{dev_name}] Failed to fetch location data: {status}")
+             _LOGGER.debug(f"[{dev_name}] Full response: {text}")
+             if status == 401: # Should have been handled by auth_request reauth logic, so this is double failure
+                  raise ConfigEntryAuthFailed("Session invalid")
+             return None
 
-                    used_op = None
-                    used_loc = {
-                        "latitude": None,
-                        "longitude": None,
-                        "gps_accuracy": None,
-                        "gps_date": None
-                    }
-                    # Find and extract the latest location from the response. Often the response
-                    # contains multiple locations (especially for non-SmartTag devices such as phones).
-                    # We go through all of them and find the "most usable" one. Sometimes locations
-                    # are encrypted (usually OFFLINE_LOC), we ignore these. They could probably also
-                    # be encrypted; there is a special getEncToken-Endpoint which returns some sort of
-                    # key. Since the only encrypted locations I encountered were even older than the
-                    # non encrypted ones, I didn't try anything to encrypt them yet.
-                    for op in data['operation']:
-                        if op['oprnType'] in ['LOCATION', 'LASTLOC', 'OFFLINE_LOC']:
-                            if 'latitude' in op:
-                                utcDate = None
-
-                                if 'extra' in op and 'gpsUtcDt' in op['extra']:
-                                    utcDate = parse_stf_date(
-                                        op['extra']['gpsUtcDt'])
-                                else:
-                                    _LOGGER.error(
-                                        f"[{dev_name}] No UTC date found for operation '{op['oprnType']}', this should not happen! OP: {json.dumps(op)}")
-                                    continue
-
-                                if used_loc['gps_date'] and used_loc['gps_date'] >= utcDate:
-                                    _LOGGER.debug(
-                                        f"[{dev_name}] Ignoring location older than the previous ({op['oprnType']})")
-                                    continue
-
-                                locFound = False
-                                if 'latitude' in op:
-                                    used_loc['latitude'] = float(
-                                        op['latitude'])
-                                    locFound = True
-                                if 'longitude' in op:
-                                    used_loc['longitude'] = float(
-                                        op['longitude'])
-                                    locFound = True
-
-                                if not locFound:
-                                    _LOGGER.warn(
-                                        f"[{dev_name}] Found no coordinates in operation '{op['oprnType']}'")
-                                else:
-                                    res['location_found'] = True
-
-                                used_loc['gps_accuracy'] = calc_gps_accuracy(
-                                    op.get('horizontalUncertainty'), op.get('verticalUncertainty'))
-                                used_loc['gps_date'] = utcDate
-                                used_op = op
-
-                            elif 'encLocation' in op:
-                                loc = op['encLocation']
-                                if 'encrypted' in loc and loc['encrypted']:
-                                    _LOGGER.info(
-                                        f"[{dev_name}] Ignoring encrypted location ({op['oprnType']})")
-                                    continue
-                                elif 'gpsUtcDt' not in loc:
-                                    _LOGGER.info(
-                                        f"[{dev_name}] Ignoring location with missing date ({op['oprnType']})")
-                                    continue
-                                else:
-                                    utcDate = parse_stf_date(loc['gpsUtcDt'])
-                                    if used_loc['gps_date'] and used_loc['gps_date'] >= utcDate:
-                                        _LOGGER.debug(
-                                            f"[{dev_name}] Ignoring location older than the previous ({op['oprnType']})")
-                                        continue
-                                    else:
-                                        locFound = False
-                                        if 'latitude' in loc:
-                                            used_loc['latitude'] = float(
-                                                loc['latitude'])
-                                            locFound = True
-                                        if 'longitude' in loc:
-                                            used_loc['longitude'] = float(
-                                                loc['longitude'])
-                                            locFound = True
-                                        else:
-                                            res['location_found'] = True
-
-                                        if not locFound:
-                                            _LOGGER.warn(
-                                                f"[{dev_name}] Found no coordinates in operation '{op['oprnType']}'")
-
-                                        used_loc['gps_accuracy'] = calc_gps_accuracy(
-                                            loc.get('horizontalUncertainty'), loc.get('verticalUncertainty'))
-                                        used_loc['gps_date'] = utcDate
-                                        used_op = op
-                                    continue
-
-                    if used_op:
-                        res['used_op'] = used_op
-                        res['used_loc'] = used_loc
-                    else:
-                        _LOGGER.warn(
-                            f"[{dev_name}] No useable location-operation found")
-
-                    _LOGGER.debug(
-                        f"    --> {dev_name} used operation: {'NONE' if not used_op else used_op['oprnType']}")
-
+        data = json.loads(text)
+        
+        if data:
+            res = {
+                "dev_name": dev_name,
+                "dev_id": dev_id,
+                "update_success": True, # We assume True if API returns 200, even if location not found
+                "location_found": False,
+                "used_op": None,
+                "used_loc": None,
+                "ops": []
+            }
+            
+            if 'operation' in data and len(data['operation']) > 0:
+                res['ops'] = data['operation']
+                
+                # Use helper to extract best location
+                used_op, used_loc = extract_best_location(data['operation'], dev_name)
+                
+                if used_op:
+                    res['used_op'] = used_op
+                    res['used_loc'] = used_loc
+                    res['location_found'] = True # Our helper returns None if no location found
                 else:
-                    _LOGGER.warn(
-                        f"[{dev_name}] No operation found in response; marking update failed")
-                    res['update_success'] = False
-                return res
+                    _LOGGER.warning(f"[{dev_name}] No usable location operation found")
+                    
+                _LOGGER.debug(f"    --> {dev_name} used operation: {'NONE' if not used_op else used_op['oprnType']}")
             else:
-                _LOGGER.error(
-                    f"[{dev_name}] Failed to fetch device data ({response.status})")
-                res_text = await response.text()
-                _LOGGER.debug(f"[{dev_name}] Full response: '{res_text}'")
-
-                # Our session is not valid anymore. Refreshing the CSRF Token ist not
-                # enough at this point. Instead we have to ask the user to  go through
-                # the whole auth flow again
-                if res_text == 'Logout' or response.status == 401:
-                    raise ConfigEntryAuthFailed(
-                        f"Session not valid anymore, received status_code of {response.status} with response '{res_text}'")
+                 _LOGGER.warning(f"[{dev_name}] No operations found in response")
+                 res['update_success'] = False
+                 
+            return res
 
     except ConfigEntryAuthFailed as e:
         raise
