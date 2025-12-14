@@ -10,6 +10,7 @@ import re
 import html
 import hashlib
 import os
+import urllib.parse
 from io import BytesIO
 from datetime import datetime, timedelta
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -51,7 +52,7 @@ def generate_code_challenge(verifier):
     return base64.urlsafe_b64encode(digest).rstrip(b'=').decode('utf-8')
 
 
-def encrypt_svc_param(svc_param_json, chk_do_num, pki_public_key_str):
+def encrypt_svc_param(svc_param_json, chk_do_num, public_key):
     # 1. SHA-256 hash of chkDoNum
     chk_do_num_hash = hashlib.sha256(str(chk_do_num).encode('utf-8')).digest()
     
@@ -149,7 +150,10 @@ async def do_login_stage_one(hass: HomeAssistant) -> tuple:
              from cryptography.hazmat.primitives.serialization import load_pem_public_key
              pass
         
-        svc_enc_param, svc_enc_ky, svc_enc_iv = encrypt_svc_param(svc_param_json, chk_do_num, pki_public_key)
+        if 'public_key' not in locals():
+             raise Exception("Failed to load public key")
+        
+        svc_enc_param, svc_enc_ky, svc_enc_iv = encrypt_svc_param(svc_param_json, chk_do_num, public_key)
 
     except Exception as e:
         _LOGGER.error(f"Encryption failed: {e}")
@@ -685,20 +689,4 @@ def get_battery_level(dev_name: str, ops: list) -> int:
     return None
 
 
-def gen_qr_code_base64(data: str) -> str:
-    """
-    Generates a QR code from the provided data and returns it as a base64-encoded string.
-    Used to show a login QR code during authentication flow
 
-    Args:
-        data (str): The data to encode in the QR code.
-
-    Returns:
-        str: The base64-encoded string representation of the QR code.
-    """
-    qr = qrcode.QRCode()
-    qr.add_data(data)
-    img = qr.make_image(fill_color="black", back_color="white")
-    buffer = BytesIO()
-    img.save(buffer, format="PNG")
-    return base64.b64encode(buffer.getvalue()).decode("utf-8")

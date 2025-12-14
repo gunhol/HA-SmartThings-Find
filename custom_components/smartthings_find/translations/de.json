@@ -3,9 +3,26 @@
     "abort": {
       "reauth_successful": "Erfolgreich authentifiziert."
     },
+    "step": {
+      "user": {
+        "title": "SmartThings Find Login",
+        "description": "Login wird vorbereitet..."
+      },
+      "auth_code": {
+        "title": "SmartThings Find Login",
+        "description": "Bitte klicke [hier]({login_url}) um dich anzumelden. \n\nNach der Anmeldung kopiere bitte die volle URL der Seite, auf die du weitergeleitet wirst (auch wenn diese einen Fehler anzeigt) und füge sie unten ein.",
+        "data": {
+          "redirect_url": "Weiterleitungs-URL"
+        }
+      }
+    },
+    "error": {
+      "login_error": "Initialisierung fehlgeschlagen: {error_msg}",
+      "auth_failed": "Authentifizierung fehlgeschlagen. Bitte überprüfen Sie die URL und versuchen Sie es erneut."
+    },
     "progress": {
       "task_stage_one": "Vorbereitung läuft, bitte warten...",
-      "task_stage_two": "Bitte scanne den QR Code mit deinem Galaxy-Gerät, um dich anzumelden. Alternativ kannst du dich direkt im Browser anmelden, indum du [hier]({url}) klickst. \n\n![QR Code](data:image/png;base64,{qr_code})\n\nCode kann nicht gescannt werden? Gehe auf [signin.samsung.com/key](https://signin.samsung.com/key/) und gib den folgenden Code ein:\n\n## ```{code}```\n"
+      "task_stage_two": "Zum Anmelden bitte [hier]({url}) klicken, um die Anmeldeseite im Browser zu öffnen. \n\nLink funktioniert nicht? Gehe auf [signin.samsung.com/key](https://signin.samsung.com/key/) und gib den folgenden Code ein:\n\n## ```{code}```\n"
     }
   },
   "options": {

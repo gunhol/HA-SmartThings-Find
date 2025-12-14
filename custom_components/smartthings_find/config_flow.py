@@ -38,7 +38,6 @@ class SmartThingsFindConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     task_stage_one: asyncio.Task | None = None
     task_stage_two: asyncio.Task | None = None
 
-    qr_url = None
     session = None
 
     jsessionid = None
